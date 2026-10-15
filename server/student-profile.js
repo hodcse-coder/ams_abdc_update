@@ -1,0 +1,24 @@
+import {normalizeDateInput} from './student-records.js';
+export function registerStudentProfile(app,pool,authenticate){
+  app.get('/api/student-profile/:id/attendance',authenticate,async(req,res)=>{
+    try{const result=await pool.query(`SELECT se.semester_id,se.semester_name,sm.subject_code,sm.subject_name,COUNT(*)::int AS held,COUNT(*) FILTER(WHERE d.attendance_status='PRESENT')::int AS attended FROM student_attendance_entry_students d JOIN student_attendance_entries ae ON ae.attendance_entry_id=d.attendance_entry_id JOIN subject_teacher_allocations a ON a.subject_teacher_allocation_id=ae.subject_teacher_allocation_id JOIN semesters se ON se.semester_id=a.semester_id JOIN subject_masters sm ON sm.subject_master_id=a.subject_master_id WHERE d.student_id=$1 GROUP BY se.semester_id,se.semester_name,sm.subject_code,sm.subject_name ORDER BY se.semester_id,sm.subject_code`,[Number(req.params.id)]);res.json({ok:true,subjects:result.rows});}catch(error){res.status(500).json({ok:false,message:'Unable to load attendance.'});}
+  });
+  app.put('/api/student-profile/:id',authenticate,async(req,res)=>{
+    const client=await pool.connect();try{
+      await client.query('BEGIN');const id=Number(req.params.id),previous=(await client.query('SELECT * FROM students WHERE student_id=$1 AND COALESCE(is_deleted,FALSE)=FALSE FOR UPDATE',[id])).rows[0];if(!previous)throw Error('Student not found.');
+      const data={...previous.student_profile_details,...req.body};
+      const text=key=>String(data[key]??'').trim();if(!text('firstName'))throw Error('First Name is required.');
+      if(text('email')&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text('email')))throw Error('Email is invalid.');
+      const dob=normalizeDateInput(data.dateOfBirth,'DOB');if(dob&&dob>=new Date().toISOString().slice(0,10))throw Error('DOB must be before today.');
+      const programmeId=Number(data.programmeId||previous.programme_id),batchId=Number(data.batchId||previous.batch_id),sectionId=data.sectionId?Number(data.sectionId):null;
+      const programme=(await client.query('SELECT department_id FROM programmes WHERE programme_id=$1 AND is_active=TRUE',[programmeId])).rows[0];if(!programme)throw Error('Programme is invalid.');
+      if(!(await client.query('SELECT 1 FROM admission_batches WHERE batch_id=$1 AND programme_id=$2',[batchId,programmeId])).rowCount)throw Error('Batch must belong to Programme.');
+      if(sectionId&&!(await client.query('SELECT 1 FROM sections WHERE section_id=$1 AND batch_id=$2',[sectionId,batchId])).rowCount)throw Error('Section must belong to Batch.');
+      if(data.admissionCategoryId&&!(await client.query('SELECT 1 FROM admission_categories WHERE admission_category_id=$1',[Number(data.admissionCategoryId)])).rowCount)throw Error('Admission Category is invalid.');
+      await client.query(`UPDATE students SET first_name=$1,middle_name=$2,last_name=$3,gender=$4,date_of_birth=$5,blood_group=$6,mobile=$7,mobile_number=$7,email=$8,current_address=$9,permanent_address=$10,admission_date=$11,admission_category_id=$12,programme_id=$13,department_id=$14,batch_id=$15,section_id=$16,student_profile_details=student_profile_details||$17::jsonb,updated_by=$18,updated_at=NOW() WHERE student_id=$19`,[text('firstName'),text('middleName')||null,text('lastName')||null,text('gender')||null,dob,text('bloodGroup')||null,text('mobile')||null,text('email')||null,text('currentAddress')||null,text('permanentAddress')||null,normalizeDateInput(data.admissionDate,'Admission Date'),data.admissionCategoryId?Number(data.admissionCategoryId):null,programmeId,programme.department_id,batchId,sectionId,JSON.stringify(data),req.auth.userId,id]);
+      const parentValues=[text('fatherName')||null,text('motherName')||null,text('guardianMobile')||null,id];const parents=await client.query('UPDATE student_parents SET father_name=$1,mother_name=$2,guardian_mobile=$3 WHERE student_id=$4',parentValues);if(!parents.rowCount)await client.query('INSERT INTO student_parents(father_name,mother_name,guardian_mobile,student_id) VALUES($1,$2,$3,$4)',parentValues);
+      for(const [prefix,type] of [['current','Present'],['permanent','Permanent']]){const values=[text(prefix+'Address'),text(prefix+'City'),text(prefix+'State'),text(prefix+'Country'),text(prefix+'Pin'),id,type];const result=await client.query('UPDATE student_addresses SET address_line1=$1,city=$2,state=$3,country=$4,pin_code=$5,updated_at=NOW() WHERE student_id=$6 AND address_type=$7',values);if(!result.rowCount&&values[0])await client.query('INSERT INTO student_addresses(address_line1,city,state,country,pin_code,student_id,address_type) VALUES($1,$2,$3,$4,$5,$6,$7)',values);}
+      await client.query('COMMIT');res.json({ok:true,message:'Student profile updated successfully.'});
+    }catch(error){await client.query('ROLLBACK');res.status(400).json({ok:false,message:error.message});}finally{client.release();}
+  });
+}

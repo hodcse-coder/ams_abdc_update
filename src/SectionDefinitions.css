@@ -1,0 +1,13 @@
+.section-definition-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:24px}.section-definitions .course-card footer button{min-width:180px}.section-definitions .section-name-sort{height:auto;padding:0;border:0;background:transparent;color:#3489b5;font-weight:700}.section-definitions th select{height:26px;font-size:10px}@media(max-width:1000px){.section-definition-fields{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}@media(max-width:550px){.section-definition-fields{grid-template-columns:1fr}.section-definitions .course-card footer button{min-width:0}}
+
+.section-master-status-field{margin-top:16px;max-width:280px}.section-master-management table th:nth-child(2){width:60%}
+
+.section-master-management .course-card th,.section-master-management .section-name-sort{color:#000}.section-master-management .course-card th,.section-master-management .course-card td{padding:5px 8px}.section-master-management .course-actions button{height:22px;padding:0 7px}.section-master-management .course-card th input{height:24px}
+
+.section-master-management>.course-card:first-child:has(form)>header>button,.section-master-management .course-card form footer button{background:#D71920;border-color:#D71920;color:#fff}.section-master-management>.course-card:first-child:has(form)>header>button:hover,.section-master-management .course-card form footer button:hover{background:#b8141a;border-color:#b8141a}
+
+.section-master-management .section-master-entry>header h3{font-size:12px}.section-master-management .section-master-entry>header{padding:10px 16px}.section-master-management .section-master-add{background:#D71920;border-color:#D71920;color:#fff}.section-master-management .section-master-add:hover{background:#b8141a;border-color:#b8141a}
+
+.section-definitions .course-card th,.section-definitions .section-name-sort{color:#000}.section-definitions .course-card th,.section-definitions .course-card td{padding:5px 8px}.section-definitions .course-actions button{height:22px;padding:0 7px}.section-definitions .course-card th input,.section-definitions .course-card th select{height:24px}
+
+.section-definitions .course-card>header>button,.section-definitions .course-card form footer button{background:#D71920;border-color:#D71920;color:#fff}.section-definitions .course-card>header>button:hover,.section-definitions .course-card form footer button:hover{background:#b8141a;border-color:#b8141a}

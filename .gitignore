@@ -11,3 +11,6 @@ dist/
 .DS_Store
 Thumbs.db
 .vite/
+
+# Local database master includes requested connection credentials.
+/ABDC_ERP.sql

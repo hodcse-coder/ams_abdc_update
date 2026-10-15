@@ -1,0 +1,9 @@
+.batch-management table{min-width:1100px}.batch-management table select{height:26px;padding:0 5px;font-size:10px}.batch-management table .batch-not-eligible{color:#d71920}.batch-management table .batch-eligible{color:#249839}.batch-management th{white-space:nowrap}.batch-status-field{max-width:300px;margin-top:18px}
+
+.batch-management .course-card th{color:#000}.batch-management .course-card>header>button,.batch-management .course-card form footer button{background:#D71920;border-color:#D71920;color:#fff}.batch-management .course-card>header>button:hover,.batch-management .course-card form footer button:hover{background:#b8141a;border-color:#b8141a}
+
+.batch-management .course-active,.batch-management .course-inactive{display:inline-flex;align-items:center;white-space:nowrap;line-height:1.4}.batch-management .course-card td:nth-child(7){white-space:nowrap;min-width:72px}
+
+.batch-management .course-card .batch-pagination{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin:0;padding:12px 16px;border-top:1px solid #e2e7ed;font-size:11px}.batch-pagination>div,.batch-pagination nav,.batch-pagination label{display:flex;align-items:center;gap:10px}.batch-pagination>div{flex-wrap:wrap}.batch-management .batch-pagination select{width:65px;height:30px}.batch-pagination span{white-space:nowrap}.batch-pagination button:disabled{cursor:default}
+
+.batch-management .batch-pagination{background:#fff;color:#172746;min-height:52px}.batch-management .batch-pagination .batch-page-active{background:#D71920;border-color:#D71920;color:#fff}.batch-management .batch-pagination nav{flex-wrap:wrap}

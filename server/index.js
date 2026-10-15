@@ -1,4 +1,23 @@
+import { applyMasterMigrations } from './master-schema.js';
+import {mentoringToday} from '../shared/mentoring-date.js';
+import {courseCoverageSql} from './course-coverage.js';
+import {attendanceRosterSql} from './attendance-roster.js';
+import {registerClassTeacherSubjectSave} from './class-teacher-subjects.js';
+import {definedSemesterSectionsSql} from './defined-semester-sections.js';
+import {registerMentoringRedesign} from './mentoring-redesign.js';
+import {registerStudentProfile} from './student-profile.js';
 import express from 'express';
+import {insertStudent,normalizeDateInput} from './student-records.js';
+import {registerStudentImportRoute} from './student-import.js';
+import {registerEmployeeUpdateRoute} from './employee-edit.js';
+import {registerSectionMasterRoutes} from './section-master-management.js';
+import {registerSectionDefinitionRoutes} from './section-definitions.js';
+import {registerSectionAssignmentRoutes} from './section-assignment.js';
+import {registerBatchRoutes} from './batch-management.js';
+import {registerCourseRoutes} from './course-management.js';
+import {subjectMatchesAllocation} from './subject-allocation-scope.js';
+import {readFile} from 'node:fs/promises';
+import {registerAcademicSubjectRoutes} from './academic-subjects.js';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { Pool } from 'pg';
@@ -247,11 +266,13 @@ async function initialiseAuthentication() {
     ['ACADEMICS','LESSON_PLAN_MENU','Lesson Plan',['Preferred Books','Course Outcome','Lesson Plan','View Lesson Plans','Material Upload','Course Coverage Report','Lesson Plan Report']],
     ['ACADEMICS','FACULTY_ALLOCATION_MENU','Faculty Allocation',['Assign Subject Teacher','Assign Class Teacher','Allot Substitute Teacher','Restore Subject Teacher','Restore Teacher Allotments','Faculty Academic Load','Faculty Performance Report']],
     ['ACADEMICS','TIMETABLE_MENU','Timetable',['Manage Classroom','Manage Timetable','Time Configuration','Break / Lunch Configuration','Timetable Entry','Faculty Timetable','Class Timetable','Room Timetable','Timetable Validation','Publish Timetable','Timetable Revision','Timetable Reports']],
-    ['STUDENT_MENTORING','MENTORING_MENU','Mentoring',['Existing Student','1st Reviewer Remarks','All Counselling & Reviews','Reviewer Allotment']],
-    ['STUDENT_MENTORING','MENTOR_ALLOTMENT_MENU','Mentor Allotment',['Existing Student','Prospective Student','Mentor Allotment Report']],
+    ['ACADEMICS','ACADEMIC_REPORTS_MENU','Academic Reports',['Attendance Entry Report','Lesson Plans Report','Teaching Load Report','Subject-wise Attendance Report','Period-wise Attendance Report','Day-wise Batch Attendance','Student Attendance Report','Student Marks Report','Course Coverage Report','Faculty Academic Load','Faculty Performance Report']],
+    ['ACADEMICS','SEMESTER_PROMOTION_MENU','Semester Promotion',['Define Semester']],
+    ['STUDENT_MENTORING','MENTORING_MENU','Mentoring',['Reviewer Allotment','All Counselling & Reviews','Mentor Activity']],
+    ['STUDENT_MENTORING','MENTOR_ALLOTMENT_MENU','Mentor Allotment',['Mentor Assignment']],
     ['COURSE','COURSE_MANAGEMENT_MENU','Course Management',['Programme','Manage Programme Sections','Merge Programme Sections','Split Programme Section','Section Master','Manage Subjects']],
     ['EMPLOYEE','EMPLOYEE_MANAGEMENT_MENU','Employee Management',['Add Employee','Manage Employee','Designation','Reset Login','Reset Password','Restore Employee']],
-    ['STUDENT','STUDENT_MANAGEMENT_MENU','Student Management',['Add Student','Add Student Section & Group','Manage Students','Reset Registration No.','Reset Password','Restore Student']],
+    ['STUDENT','STUDENT_MANAGEMENT_MENU','Student Management',['Add Student','Import Student','Manage Students','Reset Registration No.','Reset Password','Restore Student']],
     ['ADMINISTRATION','ADMINISTRATION_MENU','Administration',['Users Setting','Permissions','Login History']]
   ];
   const menuCode=value=>value.toUpperCase().replace(/&/g,'AND').replace(/[^A-Z0-9]+/g,'_').replace(/^_|_$/g,'');
@@ -261,14 +282,14 @@ async function initialiseAuthentication() {
     const parent=(await pool.query(`INSERT INTO permission_management.system_menus(module_id,menu_code,menu_name,display_order)
       VALUES($1,$2,$3,10) ON CONFLICT(menu_code) DO UPDATE SET module_id=EXCLUDED.module_id,menu_name=EXCLUDED.menu_name,status=TRUE RETURNING menu_id`,[module.module_id,parentCode,parentName])).rows[0];
     for(let index=0;index<children.length;index++){
-      const name=children[index],code=parentCode==='MENTORING_MENU'&&name==='Existing Student'?'MENTOR_ACTIVITY':`${parentCode}_${menuCode(name)}`;
+      const name=children[index],code=parentCode==='MENTORING_MENU'&&name==='Mentor Activity'?'MENTOR_ACTIVITY':`${parentCode}_${menuCode(name)}`;
       await pool.query(`INSERT INTO permission_management.system_menus(module_id,parent_menu_id,menu_code,menu_name,menu_path,display_order)
         VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(menu_code) DO UPDATE SET module_id=EXCLUDED.module_id,parent_menu_id=EXCLUDED.parent_menu_id,menu_name=EXCLUDED.menu_name,menu_path=EXCLUDED.menu_path,status=TRUE`,
         [module.module_id,parent.menu_id,code,name,`${moduleCode}::${parentName}::${name}`,index+1]);
     }
   }
-  await pool.query(`UPDATE permission_management.system_menus child SET menu_name='Existing Student',parent_menu_id=parent.menu_id,
-    module_id=parent.module_id,menu_path='Student Mentoring::Mentoring::Existing Student'
+  await pool.query(`UPDATE permission_management.system_menus child SET menu_name='Mentor Activity',parent_menu_id=parent.menu_id,
+    module_id=parent.module_id,menu_path='Student Mentoring::Mentoring::Mentor Activity'
     FROM permission_management.system_menus parent WHERE child.menu_code='MENTOR_ACTIVITY' AND parent.menu_code='MENTORING_MENU'`);
   await pool.query(`INSERT INTO permission_management.roles(role_code,role_name,description,is_system_role) VALUES
     ('ADMIN','Administrator','Full system access',TRUE),('FACULTY','Faculty','Teaching faculty access',TRUE),
@@ -301,7 +322,7 @@ async function initialiseAuthentication() {
   await pool.query('ALTER TABLE students ADD COLUMN IF NOT EXISTS student_group VARCHAR(30)');
   await pool.query(`CREATE TABLE IF NOT EXISTS subject_masters (
     subject_master_id BIGSERIAL PRIMARY KEY,
-    subject_code VARCHAR(30) NOT NULL UNIQUE,
+    subject_code VARCHAR(30) NOT NULL,
     subject_name VARCHAR(200) NOT NULL,
     subject_short_name VARCHAR(50),
     subject_type VARCHAR(30) NOT NULL DEFAULT 'Theory',
@@ -1018,7 +1039,7 @@ app.get('/api/dashboard-counts', authenticate, async (_req,res)=>{
     pool.query(`SELECT COUNT(*)::INTEGER AS count FROM students WHERE is_active=TRUE AND COALESCE(is_deleted,FALSE)=FALSE`),
     pool.query(`SELECT COUNT(*)::INTEGER AS count FROM employees WHERE UPPER(COALESCE(status,''))='ACTIVE'`),
     pool.query(`SELECT COUNT(*)::INTEGER AS count FROM departments WHERE is_active=TRUE`),
-    pool.query(`SELECT COUNT(*)::INTEGER AS count FROM subject_masters WHERE is_active=TRUE`),
+    pool.query(`SELECT COUNT(*)::INTEGER AS count FROM subject_masters sm JOIN programmes p ON p.programme_id=sm.programme_id JOIN semesters se ON se.semester_id=sm.semester_id WHERE sm.is_active=TRUE`),
     pool.query(`SELECT COUNT(*)::INTEGER AS count FROM library_books WHERE is_active=TRUE`),
     pool.query(`SELECT d.department_id AS id,d.department_code AS code,d.department_name AS name,
         COALESCE(SUM(p.intake_capacity),0)::INTEGER AS capacity
@@ -1386,78 +1407,16 @@ app.post('/api/login-history/:id/terminate', authenticate, async (req,res)=>{
   }catch(error){res.status(500).json({ok:false,message:'Unable to terminate the session.'});}
 });
 
-function normalizeDateInput(value,label){
-  const text=String(value??'').trim();
-  if(!text)return null;
-  if(/^\d{5}(\.\d+)?$/.test(text)){
-    const date=new Date(Date.UTC(1899,11,30)+Number(text)*86400000);
-    return date.toISOString().slice(0,10);
-  }
-  let match=text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
-  if(match){
-    const [,year,month,day]=match;
-    const iso=`${year}-${month.padStart(2,'0')}-${day.padStart(2,'0')}`;
-    if(!Number.isNaN(Date.parse(`${iso}T00:00:00Z`)))return iso;
-  }
-  match=text.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
-  if(match){
-    const [,day,month,year]=match;
-    const iso=`${year}-${month.padStart(2,'0')}-${day.padStart(2,'0')}`;
-    if(!Number.isNaN(Date.parse(`${iso}T00:00:00Z`)))return iso;
-  }
-  throw new Error(`${label} "${text}" is invalid. Use YYYY-MM-DD or DD-MM-YYYY.`);
-}
-
-async function insertStudent(client,data,userId){
-  const admissionDate=normalizeDateInput(data.admissionDate,'Admission Date');
-  const dateOfBirth=normalizeDateInput(data.dateOfBirth,'Date of Birth');
-  const institutionId=(await client.query('SELECT institution_id FROM institutions WHERE is_active=TRUE ORDER BY institution_id LIMIT 1')).rows[0]?.institution_id;
-  if(!institutionId)throw new Error('Create an active institution before adding students.');
-  const academicYear=(await client.query('SELECT year_label,start_date FROM academic_years WHERE academic_year_id=$1',[Number(data.academicYearId)])).rows[0];
-  const programme=(await client.query('SELECT programme_id,department_id FROM programmes WHERE programme_id=$1 AND is_active=TRUE',[Number(data.programmeId)])).rows[0];
-  if(!academicYear||!programme||Number(programme.department_id)!==Number(data.departmentId))throw new Error('Academic year, department, or programme is invalid.');
-  const academicStartYear=academicYear.start_date instanceof Date?academicYear.start_date.getFullYear():Number(String(academicYear.start_date||'').slice(0,4));
-  const admissionYear=academicStartYear||Number(String(admissionDate||'').slice(0,4));
-  if(!admissionYear)throw new Error('The selected Academic Year has no valid start year.');
-  let batchId=(await client.query('SELECT batch_id FROM admission_batches WHERE programme_id=$1 AND admission_year=$2 LIMIT 1',[programme.programme_id,admissionYear])).rows[0]?.batch_id;
-  if(!batchId)batchId=(await client.query(`INSERT INTO admission_batches
-    (programme_id,admission_year,batch_name,start_date,is_active) VALUES ($1,$2,$3,$4,TRUE)
-    RETURNING batch_id`,[programme.programme_id,admissionYear,`${programme.programme_id}-${admissionYear}`,academicYear.start_date])).rows[0].batch_id;
-  const id=Number((await client.query(`SELECT nextval(pg_get_serial_sequence('students','student_id')) AS id`)).rows[0].id);
-  const serial=String(id).padStart(5,'0'),year=String(admissionYear);
-  const registrationNumber=data.registrationNumber?.trim()||`REG-${year}-${serial}`;
-  const rollNumber=data.rollNumber?.trim()||`ROLL-${year}-${serial}`;
-  const studentCode=`STU-${year}-${serial}`;
-  const nameParts=String(data.studentName||'').trim().split(/\s+/);const firstName=nameParts.shift();const lastName=nameParts.length>1?nameParts.pop():null;const middleName=nameParts.join(' ')||null;
-  const activeStatus=(await client.query(`SELECT student_status_id FROM student_statuses WHERE institute_id=$1 AND status_code='ACTIVE' LIMIT 1`,[institutionId])).rows[0]?.student_status_id||null;
-  await client.query(`INSERT INTO students
-    (student_id,institution_id,institute_id,programme_id,batch_id,section_id,department_id,branch_id,
-     academic_year_id,semester_id,admission_category_id,student_status_id,registration_no,roll_no,
-     admission_no,registration_number,roll_number,admission_number,student_code,first_name,middle_name,
-     last_name,gender,date_of_birth,category,blood_group,mobile,email,current_address,permanent_address,
-     admission_date,admission_type,profile_photo_name,profile_photo_mime_type,profile_photo_size,
-     status,is_active,is_deleted,created_by)
-    VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$12,$13,$14,$15,$16,$17,$18,$19,$20,
-      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,'ACTIVE',TRUE,FALSE,$32)`,
-    [id,institutionId,programme.programme_id,batchId,data.sectionId?Number(data.sectionId):null,Number(data.departmentId),data.branchId?Number(data.branchId):null,
-      Number(data.academicYearId),data.semesterId?Number(data.semesterId):null,data.admissionCategoryId?Number(data.admissionCategoryId):null,activeStatus,
-      registrationNumber,rollNumber,data.admissionNumber.trim(),studentCode,firstName,middleName,lastName,data.gender||null,dateOfBirth,
-      data.category||null,data.bloodGroup||null,data.mobile?.trim()||null,data.email?.trim()||null,data.presentAddress?.trim()||null,
-      data.permanentAddress?.trim()||null,admissionDate,data.admissionType||null,data.photoName||null,data.photoMimeType||null,
-      data.photoSize?Number(data.photoSize):null,userId]);
-  await client.query(`INSERT INTO student_parents
-    (student_id,father_name,mother_name,guardian_mobile) VALUES ($1,$2,$3,$4)`,
-    [id,data.fatherName?.trim()||null,data.motherName?.trim()||null,data.guardianMobile?.trim()||null]);
-  await client.query('UPDATE students SET student_profile_details=$1::jsonb WHERE student_id=$2',[JSON.stringify(data),id]);
-  for(const [type,address] of [['Present',data.presentAddress],['Permanent',data.permanentAddress]])if(address?.trim())await client.query(`INSERT INTO student_addresses
-    (student_id,address_type,address_line1) VALUES ($1,$2,$3)`,[id,type,address.trim()]);
-  return {id,registrationNumber,rollNumber,studentCode};
-}
-
 const sectionMasterCode=name=>{
   const cleaned=String(name||'').trim().toUpperCase().replace(/^SECTION\s+/,'').replace(/[^A-Z0-9]+/g,'-').replace(/^-|-$/g,'');
   return `SEC-${cleaned||'SECTION'}`;
 };
+
+registerAcademicSubjectRoutes(app,pool,authenticate);
+registerCourseRoutes(app,pool,authenticate);
+registerBatchRoutes(app,pool,authenticate);
+registerSectionAssignmentRoutes(app,pool,authenticate);
+registerSectionDefinitionRoutes(app,pool,authenticate);
 
 app.get('/api/subject-masters', authenticate, async (_req,res)=>{
   try{
@@ -1499,7 +1458,7 @@ app.post('/api/subject-masters/bulk', authenticate, async (req,res)=>{
       await client.query(`INSERT INTO subject_masters
         (subject_code,subject_name,subject_short_name,subject_type,subject_category,department_id,credit,created_by)
         VALUES ($1,$2,$3,$4,'Professional Core',$5,$6,$7)
-        ON CONFLICT (subject_code) DO UPDATE SET subject_name=EXCLUDED.subject_name,
+        ON CONFLICT (subject_code) WHERE programme_id IS NULL AND semester_id IS NULL DO UPDATE SET subject_name=EXCLUDED.subject_name,
           subject_short_name=EXCLUDED.subject_short_name,subject_type=EXCLUDED.subject_type,
           credit=EXCLUDED.credit,updated_by=EXCLUDED.created_by,updated_at=NOW()`,
         [code,name,String(row.alias||'').trim().toUpperCase()||null,String(row.type||'Theory').trim(),department.department_id,credit,req.auth.userId]);
@@ -1533,9 +1492,9 @@ app.get('/api/course-outcomes', authenticate, async (req,res)=>{
     const [subjects,codes,faculty,outcomes]=await Promise.all([
       pool.query(`SELECT DISTINCT sm.subject_master_id AS id,sm.subject_code AS code,sm.subject_name AS name
         FROM subject_masters sm
-        LEFT JOIN academics.faculty_subject_assignments fsa ON fsa.subject_id=sm.subject_master_id
-          AND fsa.assignment_status='Active'
-        WHERE sm.is_active=TRUE AND ($1::bigint IS NULL OR fsa.faculty_employee_id=$1)
+        LEFT JOIN subject_teacher_allocations fsa ON fsa.subject_master_id=sm.subject_master_id
+          AND fsa.status='ACTIVE'
+        WHERE sm.is_active=TRUE AND ($1::bigint IS NULL OR fsa.employee_id=$1)
         ORDER BY sm.subject_name`,[employeeId]),
       pool.query(`SELECT co_code_id AS id,co_code AS code,co_number,display_order
         FROM academics.course_outcome_codes WHERE is_active=TRUE ORDER BY display_order`),
@@ -1549,9 +1508,9 @@ app.get('/api/course-outcomes', authenticate, async (req,res)=>{
         FROM academics.course_outcomes co JOIN subject_masters sm ON sm.subject_master_id=co.subject_master_id
         JOIN academics.course_outcome_codes cc ON cc.co_code_id=co.co_code_id
         LEFT JOIN employees e ON e.employee_id=co.faculty_employee_id
-        WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM academics.faculty_subject_assignments fsa
-          WHERE fsa.subject_id=co.subject_master_id AND fsa.faculty_employee_id=$1
-          AND fsa.assignment_status='Active')
+        WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM subject_teacher_allocations fsa
+          WHERE fsa.subject_master_id=co.subject_master_id AND fsa.employee_id=$1
+          AND fsa.status='ACTIVE')
         ORDER BY sm.subject_name,cc.display_order`,[employeeId])
     ]);
     res.json({ok:true,canViewAllFaculty:employeeId===null,employeeId,subjects:subjects.rows,codes:codes.rows,faculty:faculty.rows,outcomes:outcomes.rows});
@@ -1564,8 +1523,8 @@ app.post('/api/course-outcomes', authenticate, async (req,res)=>{
   const client=await pool.connect();
   try{
     const employeeId=await authenticatedEmployeeId(req);
-    if(employeeId!==null){const allowed=await client.query(`SELECT 1 FROM academics.faculty_subject_assignments
-      WHERE subject_id=$1 AND faculty_employee_id=$2 AND assignment_status='Active' LIMIT 1`,[Number(data.subjectId),employeeId]);
+    if(employeeId!==null){const allowed=await client.query(`SELECT 1 FROM subject_teacher_allocations
+      WHERE subject_master_id=$1 AND employee_id=$2 AND status='ACTIVE' LIMIT 1`,[Number(data.subjectId),employeeId]);
       if(!allowed.rowCount)return res.status(403).json({ok:false,message:'You can create Course Outcomes only for subjects assigned to your employee account.'});}
     const facultyId=employeeId===null?(data.facultyId?Number(data.facultyId):null):Number(employeeId);
     await client.query('BEGIN');
@@ -1589,9 +1548,10 @@ app.put('/api/course-outcomes/:id', authenticate, async (req,res)=>{
   const client=await pool.connect();
   try{
     const employeeId=await authenticatedEmployeeId(req);
-    if(employeeId!==null){const allowed=await client.query(`SELECT 1 FROM academics.faculty_subject_assignments
-      WHERE subject_id=$1 AND faculty_employee_id=$2 AND assignment_status='Active' LIMIT 1`,[Number(data.subjectId),employeeId]);
+    if(employeeId!==null){const allowed=await client.query(`SELECT 1 FROM subject_teacher_allocations
+      WHERE subject_master_id=$1 AND employee_id=$2 AND status='ACTIVE' LIMIT 1`,[Number(data.subjectId),employeeId]);
       if(!allowed.rowCount)return res.status(403).json({ok:false,message:'You can update Course Outcomes only for subjects assigned to your employee account.'});}
+    if(employeeId!==null){const existing=await client.query("SELECT 1 FROM academics.course_outcomes co JOIN subject_teacher_allocations a ON a.subject_master_id=co.subject_master_id WHERE co.course_outcome_id=$1 AND a.employee_id=$2 AND a.status='ACTIVE' LIMIT 1",[id,employeeId]);if(!existing.rowCount)return res.status(403).json({ok:false,message:'This Course Outcome is outside your current subject assignments.'});}
     const facultyId=employeeId===null?(data.facultyId?Number(data.facultyId):null):Number(employeeId);
     await client.query('BEGIN');
     const result=await client.query(`UPDATE academics.course_outcomes SET subject_master_id=$1,
@@ -1617,6 +1577,11 @@ app.put('/api/course-outcomes/:id', authenticate, async (req,res)=>{
 app.get('/api/lesson-plans', authenticate, async (req,res)=>{
   try{
     const employeeId=await authenticatedEmployeeId(req);
+    if(employeeId===null&&req.query.layoutOnly==='true'){
+      const years=await pool.query('SELECT academic_year_id AS id,year_label AS name FROM academic_years WHERE is_active=TRUE ORDER BY is_current DESC,start_date DESC');
+      const semesters=await pool.query('SELECT DISTINCT semester_number AS id,semester_name AS name FROM semesters WHERE is_active=TRUE ORDER BY semester_number');
+      return res.json({ok:true,canViewAllFaculty:true,employeeId:null,academicYears:years.rows,semesters:semesters.rows,faculty:[],assignments:[]});
+    }
     await pool.query(`INSERT INTO academics.faculty_subject_assignments
       (academic_year_id,programme_batch_id,semester_id,programme_section_id,subject_id,faculty_employee_id,assignment_status,assigned_by)
       SELECT academic_year_id,batch_id,semester_id,section_id,subject_master_id,employee_id,
@@ -1688,8 +1653,9 @@ app.get('/api/view-lesson-plans', authenticate, async (_req,res)=>{
   }catch(error){console.error('View lesson plans query error:',error.message);res.status(500).json({ok:false,message:'Unable to load published Lesson Plans.'});}
 });
 
-app.get('/api/course-coverage-report', authenticate, async (_req,res)=>{
+app.get('/api/course-coverage-report', authenticate, async (req,res)=>{
   try{
+    const employeeId=await authenticatedEmployeeId(req);
     const [academicYears,batches,semesters,subjects,faculty,rows]=await Promise.all([
       pool.query(`SELECT academic_year_id AS id,year_label AS name FROM academic_years
         WHERE is_active=TRUE ORDER BY is_current DESC,start_date DESC`),
@@ -1703,21 +1669,7 @@ app.get('/api/course-coverage-report', authenticate, async (_req,res)=>{
       pool.query(`SELECT employee_id AS id,employee_code AS code,
         TRIM(CONCAT(first_name,' ',middle_name,' ',last_name)) AS name
         FROM employees WHERE status='ACTIVE' ORDER BY first_name,last_name`),
-      pool.query(`SELECT lp.lesson_plan_id AS id,fsa.academic_year_id,fsa.programme_batch_id,
-        fsa.semester_id,fsa.subject_id,fsa.faculty_employee_id,sm.subject_code,sm.subject_name,
-        TRIM(CONCAT(e.first_name,' ',e.middle_name,' ',e.last_name)) AS faculty_name,
-        COALESCE(SUM(t.planned_periods),0)::int AS planned_periods,
-        COALESCE(SUM(t.planned_periods) FILTER (WHERE t.topic_status='Completed'),0)::int AS completed_periods,
-        CASE WHEN COALESCE(SUM(t.planned_periods),0)=0 THEN 0 ELSE
-          ROUND(100.0*COALESCE(SUM(t.planned_periods) FILTER (WHERE t.topic_status='Completed'),0)/SUM(t.planned_periods),2) END AS coverage
-        FROM academics.lesson_plan_headers lp
-        JOIN academics.faculty_subject_assignments fsa ON fsa.faculty_subject_assignment_id=lp.faculty_subject_assignment_id
-        JOIN subject_masters sm ON sm.subject_master_id=fsa.subject_id
-        JOIN employees e ON e.employee_id=fsa.faculty_employee_id
-        LEFT JOIN academics.lesson_plan_topics t ON t.lesson_plan_id=lp.lesson_plan_id
-        GROUP BY lp.lesson_plan_id,fsa.academic_year_id,fsa.programme_batch_id,fsa.semester_id,
-          fsa.subject_id,fsa.faculty_employee_id,sm.subject_code,sm.subject_name,e.first_name,e.middle_name,e.last_name
-        ORDER BY sm.subject_code`)
+      pool.query(courseCoverageSql,[employeeId])
     ]);
     res.json({ok:true,academicYears:academicYears.rows,batches:batches.rows,semesters:semesters.rows,
       subjects:subjects.rows,faculty:faculty.rows,rows:rows.rows});
@@ -1988,7 +1940,7 @@ app.get('/api/student-attendance-report', authenticate, async (req,res)=>{
   }catch(error){console.error('Student attendance report error:',error.message);res.status(500).json({ok:false,message:'Unable to generate student attendance report.'});}
 });
 
-app.get('/api/student-attendance', authenticate, async (_req,res)=>{
+app.get('/api/student-attendance', authenticate, async (req,res)=>{
   try{const [entries,programmes,batches,semesters,sections,subjects,groups]=await Promise.all([
     pool.query(`SELECT ae.attendance_entry_id AS id,ae.attendance_date::text AS attendance_date,ae.start_time,ae.end_time,ae.topic_covered,ae.student_group,ae.strength,ae.present_count,ae.absent_count,p.programme_id,p.programme_code,b.batch_id,b.batch_name,se.semester_id,se.semester_name,s.section_id,COALESCE(sec.section_master_name,s.section_name) AS section_name,sm.subject_master_id,sm.subject_code,sm.subject_name,sm.subject_type,TRIM(CONCAT_WS(' ',e.first_name,e.middle_name,e.last_name)) AS faculty_name FROM student_attendance_entries ae JOIN subject_teacher_allocations a ON a.subject_teacher_allocation_id=ae.subject_teacher_allocation_id JOIN admission_batches b ON b.batch_id=a.batch_id JOIN programmes p ON p.programme_id=b.programme_id JOIN semesters se ON se.semester_id=a.semester_id JOIN sections s ON s.section_id=a.section_id LEFT JOIN section_masters sec ON sec.section_master_id=s.section_master_id JOIN subject_masters sm ON sm.subject_master_id=a.subject_master_id LEFT JOIN employees e ON e.employee_id=a.employee_id ORDER BY ae.attendance_date DESC,ae.start_time DESC`),
     pool.query(`SELECT programme_id AS id,programme_code AS code,programme_name AS name FROM programmes WHERE is_active=TRUE ORDER BY programme_name`),
@@ -1997,7 +1949,7 @@ app.get('/api/student-attendance', authenticate, async (_req,res)=>{
     pool.query(`SELECT s.section_id AS id,s.batch_id,s.semester_id,COALESCE(sm.section_master_name,s.section_name) AS name FROM sections s LEFT JOIN section_masters sm ON sm.section_master_id=s.section_master_id WHERE s.is_active=TRUE ORDER BY name`),
     pool.query(`SELECT subject_master_id AS id,subject_code AS code,subject_name AS name,subject_type AS type FROM subject_masters WHERE is_active=TRUE ORDER BY subject_name`),
     pool.query(`SELECT DISTINCT UPPER(TRIM(student_group)) AS name FROM students WHERE NULLIF(TRIM(student_group),'') IS NOT NULL AND COALESCE(is_deleted,FALSE)=FALSE ORDER BY name`)
-  ]);res.json({ok:true,entries:entries.rows,programmes:programmes.rows,batches:batches.rows,semesters:semesters.rows,sections:sections.rows,subjects:subjects.rows,groups:groups.rows});}catch(error){console.error('Student attendance query error:',error.message);res.status(500).json({ok:false,message:'Unable to load student attendance.'});}
+  ]);res.json({ok:true,entries:['ADMIN','SUPER_ADMIN','INSTITUTE_ADMIN'].includes(req.auth.role)&&req.query.layoutOnly==='true'?[]:entries.rows,programmes:programmes.rows,batches:batches.rows,semesters:semesters.rows,sections:sections.rows,subjects:subjects.rows,groups:['ADMIN','SUPER_ADMIN','INSTITUTE_ADMIN'].includes(req.auth.role)&&req.query.layoutOnly==='true'?[]:groups.rows});}catch(error){console.error('Student attendance query error:',error.message);res.status(500).json({ok:false,message:'Unable to load student attendance.'});}
 });
 
 app.patch('/api/student-attendance/:id/date', authenticate, async (req,res)=>{
@@ -2053,6 +2005,8 @@ app.get('/api/subject-teacher-allocations/:id/attendance-options', authenticate,
     const allocation=(await pool.query(`SELECT a.academic_year_id,a.batch_id,a.semester_id,a.section_id,
       a.subject_master_id,a.employee_id FROM subject_teacher_allocations a
       WHERE a.subject_teacher_allocation_id=$1 AND a.status='ACTIVE'`,[id])).rows[0];
+    const employeeId=await authenticatedEmployeeId(req);
+    if(allocation&&employeeId!==null&&Number(allocation.employee_id)!==Number(employeeId))return res.status(403).json({ok:false,message:'This course is not assigned to your account.'});
     if(!allocation)return res.status(404).json({ok:false,message:'The selected course allocation is not active.'});
     const [topics,students]=await Promise.all([
       pool.query(`SELECT t.lesson_plan_topic_id AS id,t.lesson_number,t.topic_description AS name,
@@ -2065,11 +2019,7 @@ app.get('/api/subject-teacher-allocations/:id/attendance-options', authenticate,
           AND fsa.programme_section_id=$4 AND fsa.subject_id=$5 AND fsa.faculty_employee_id=$6
           AND fsa.assignment_status='Active' ORDER BY t.lesson_number`,[allocation.academic_year_id,allocation.batch_id,
           allocation.semester_id,allocation.section_id,allocation.subject_master_id,allocation.employee_id,id]),
-      pool.query(`SELECT st.student_id AS id,
-        COALESCE(NULLIF(st.registration_number,''),NULLIF(st.registration_no,''),st.student_code) AS code,
-        TRIM(CONCAT_WS(' ',st.first_name,st.middle_name,st.last_name)) AS name
-        FROM students st WHERE st.section_id=$1 AND COALESCE(st.is_deleted,FALSE)=FALSE AND st.is_active=TRUE
-        ORDER BY COALESCE(NULLIF(st.roll_number,''),NULLIF(st.roll_no,''),st.registration_number,st.student_code),st.student_id`,[allocation.section_id])
+      pool.query(attendanceRosterSql,[allocation.section_id])
     ]);
     res.json({ok:true,topics:topics.rows,students:students.rows});
   }catch(error){console.error('Attendance options query error:',error.message);res.status(500).json({ok:false,message:'Unable to load topics and students for this course.'});}
@@ -2079,7 +2029,7 @@ app.post('/api/student-attendance', authenticate, async (req,res)=>{
   const d=req.body,id=Number(d.subjectAllocationId);
   if(!id||!d.date||!d.startTime||!d.endTime||d.endTime<=d.startTime||!d.topic?.trim())return res.status(400).json({ok:false,message:'Complete all attendance fields with a valid time range.'});
   const presentIds=[...new Set((Array.isArray(d.presentStudentIds)?d.presentStudentIds:[]).map(Number).filter(Boolean))],client=await pool.connect();
-  try{await client.query('BEGIN');const alreadyTaken=await client.query(`SELECT 1 FROM student_attendance_entries WHERE subject_teacher_allocation_id=$1 AND LOWER(TRIM(topic_covered))=LOWER(TRIM($2)) LIMIT 1`,[id,d.topic]);if(alreadyTaken.rowCount){await client.query('ROLLBACK');return res.status(409).json({ok:false,message:'Attendance Already Taken'});}const students=(await client.query(`SELECT st.student_id AS id FROM students st JOIN subject_teacher_allocations a ON a.section_id=st.section_id WHERE a.subject_teacher_allocation_id=$1 AND COALESCE(st.is_deleted,FALSE)=FALSE AND st.is_active=TRUE ORDER BY st.student_id`,[id])).rows,validIds=students.map(x=>Number(x.id)),validSet=new Set(validIds),selected=presentIds.filter(studentId=>validSet.has(studentId)),strength=validIds.length,present=selected.length,absent=strength-present;
+  try{await client.query('BEGIN');const allocation=(await client.query("SELECT section_id,employee_id FROM subject_teacher_allocations WHERE subject_teacher_allocation_id=$1 AND status='ACTIVE' FOR SHARE",[id])).rows[0];if(!allocation){await client.query('ROLLBACK');return res.status(400).json({ok:false,message:'Select an active course allocation.'});}const employeeId=await authenticatedEmployeeId(req,client);if(employeeId!==null&&Number(employeeId)!==Number(allocation.employee_id)){await client.query('ROLLBACK');return res.status(403).json({ok:false,message:'This course is not assigned to your account.'});}const alreadyTaken=await client.query(`SELECT 1 FROM student_attendance_entries WHERE subject_teacher_allocation_id=$1 AND LOWER(TRIM(topic_covered))=LOWER(TRIM($2)) LIMIT 1`,[id,d.topic]);if(alreadyTaken.rowCount){await client.query('ROLLBACK');return res.status(409).json({ok:false,message:'Attendance Already Taken'});}const students=(await client.query(attendanceRosterSql,[allocation.section_id])).rows,validIds=students.map(x=>Number(x.id)),validSet=new Set(validIds),selected=presentIds.filter(studentId=>validSet.has(studentId)),strength=validIds.length,present=selected.length,absent=strength-present;
     const entry=await client.query(`INSERT INTO student_attendance_entries (subject_teacher_allocation_id,attendance_date,start_time,end_time,topic_covered,strength,present_count,absent_count,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING attendance_entry_id`,[id,d.date,d.startTime,d.endTime,d.topic.trim(),strength,present,absent,req.auth.userId]);
     if(validIds.length)await client.query(`INSERT INTO student_attendance_entry_students (attendance_entry_id,student_id,attendance_status,created_by) SELECT $1,x,CASE WHEN x=ANY($2::bigint[]) THEN 'PRESENT' ELSE 'ABSENT' END,$3 FROM UNNEST($4::bigint[]) x`,[entry.rows[0].attendance_entry_id,selected,req.auth.userId,validIds]);
     await client.query('COMMIT');res.status(201).json({ok:true,message:'Student attendance saved successfully.'});
@@ -2092,20 +2042,20 @@ app.get('/api/preferred-books', authenticate, async (req,res)=>{
     const [subjects,books]=await Promise.all([
       pool.query(`SELECT DISTINCT sm.subject_master_id AS id,sm.subject_code AS code,sm.subject_name AS name
         FROM subject_masters sm
-        LEFT JOIN academics.faculty_subject_assignments fsa ON fsa.subject_id=sm.subject_master_id
-          AND fsa.assignment_status='Active'
-        WHERE sm.is_active=TRUE AND ($1::bigint IS NULL OR fsa.faculty_employee_id=$1)
+        LEFT JOIN subject_teacher_allocations fsa ON fsa.subject_master_id=sm.subject_master_id
+          AND fsa.status='ACTIVE'
+        WHERE sm.is_active=TRUE AND ($1::bigint IS NULL OR fsa.employee_id=$1)
         ORDER BY sm.subject_name`,[employeeId]),
       pool.query(`SELECT pb.preferred_book_id AS id,pb.subject_master_id,sm.subject_code,sm.subject_name,
         pb.book_title,pb.author_name,pb.publisher_name,pb.edition,pb.isbn,pb.book_type,
         pb.display_order,pb.is_active FROM preferred_books pb
         JOIN subject_masters sm ON sm.subject_master_id=pb.subject_master_id
-        WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM academics.faculty_subject_assignments fsa
-          WHERE fsa.subject_id=pb.subject_master_id AND fsa.faculty_employee_id=$1
-          AND fsa.assignment_status='Active')
+        WHERE $1::bigint IS NULL OR EXISTS (SELECT 1 FROM subject_teacher_allocations fsa
+          WHERE fsa.subject_master_id=pb.subject_master_id AND fsa.employee_id=$1
+          AND fsa.status='ACTIVE')
         ORDER BY sm.subject_name,pb.display_order,pb.book_title`,[employeeId])
     ]);
-    res.json({ok:true,subjects:subjects.rows,books:books.rows});
+    res.json({ok:true,subjects:subjects.rows,books:employeeId===null&&req.query.layoutOnly==='true'?[]:books.rows});
   }catch(error){console.error('Preferred books query error:',error.message);res.status(500).json({ok:false,message:'Unable to load preferred books.'});}
 });
 
@@ -2114,8 +2064,8 @@ app.post('/api/preferred-books', authenticate, async (req,res)=>{
   if(!Number(data.subjectId)||!data.title?.trim()||!data.author?.trim()||!['TEXT_BOOK','REFERENCE_BOOK','E_BOOK'].includes(data.bookType))return res.status(400).json({ok:false,message:'Subject, title, author, and book type are required.'});
   try{
     const employeeId=await authenticatedEmployeeId(req);
-    if(employeeId!==null){const allowed=await pool.query(`SELECT 1 FROM academics.faculty_subject_assignments
-      WHERE subject_id=$1 AND faculty_employee_id=$2 AND assignment_status='Active' LIMIT 1`,[Number(data.subjectId),employeeId]);
+    if(employeeId!==null){const allowed=await pool.query(`SELECT 1 FROM subject_teacher_allocations
+      WHERE subject_master_id=$1 AND employee_id=$2 AND status='ACTIVE' LIMIT 1`,[Number(data.subjectId),employeeId]);
       if(!allowed.rowCount)return res.status(403).json({ok:false,message:'You can add Preferred Books only for subjects assigned to your employee account.'});}
     const result=await pool.query(`INSERT INTO preferred_books
     (subject_master_id,book_title,author_name,publisher_name,edition,isbn,book_type,display_order,created_by)
@@ -2132,9 +2082,10 @@ app.put('/api/preferred-books/:id', authenticate, async (req,res)=>{
   if(!id||!Number(data.subjectId)||!data.title?.trim()||!data.author?.trim()||!['TEXT_BOOK','REFERENCE_BOOK','E_BOOK'].includes(data.bookType)||Number(data.displayOrder)<=0)return res.status(400).json({ok:false,message:'Complete all required preferred book fields.'});
   try{
     const employeeId=await authenticatedEmployeeId(req);
-    if(employeeId!==null){const allowed=await pool.query(`SELECT 1 FROM academics.faculty_subject_assignments
-      WHERE subject_id=$1 AND faculty_employee_id=$2 AND assignment_status='Active' LIMIT 1`,[Number(data.subjectId),employeeId]);
+    if(employeeId!==null){const allowed=await pool.query(`SELECT 1 FROM subject_teacher_allocations
+      WHERE subject_master_id=$1 AND employee_id=$2 AND status='ACTIVE' LIMIT 1`,[Number(data.subjectId),employeeId]);
       if(!allowed.rowCount)return res.status(403).json({ok:false,message:'You can edit Preferred Books only for subjects assigned to your employee account.'});}
+    if(employeeId!==null){const owned=await pool.query("SELECT 1 FROM preferred_books pb JOIN subject_teacher_allocations a ON a.subject_master_id=pb.subject_master_id WHERE pb.preferred_book_id=$1 AND a.employee_id=$2 AND a.status='ACTIVE' LIMIT 1",[id,employeeId]);if(!owned.rowCount)return res.status(403).json({ok:false,message:'You can edit only books for your currently assigned subjects.'});}
     const result=await pool.query(`UPDATE preferred_books SET subject_master_id=$1,book_title=$2,
     author_name=$3,publisher_name=$4,edition=$5,isbn=$6,book_type=$7,display_order=$8,
     is_active=TRUE,updated_by=$9,updated_at=NOW() WHERE preferred_book_id=$10 RETURNING preferred_book_id`,
@@ -2149,8 +2100,8 @@ app.delete('/api/preferred-books/:id', authenticate, async (req,res)=>{
   try{
     const employeeId=await authenticatedEmployeeId(req);
     if(employeeId!==null){const allowed=await pool.query(`SELECT 1 FROM preferred_books pb
-      JOIN academics.faculty_subject_assignments fsa ON fsa.subject_id=pb.subject_master_id
-      WHERE pb.preferred_book_id=$1 AND fsa.faculty_employee_id=$2 AND fsa.assignment_status='Active' LIMIT 1`,[id,employeeId]);
+      JOIN subject_teacher_allocations fsa ON fsa.subject_master_id=pb.subject_master_id
+      WHERE pb.preferred_book_id=$1 AND fsa.employee_id=$2 AND fsa.status='ACTIVE' LIMIT 1`,[id,employeeId]);
       if(!allowed.rowCount)return res.status(403).json({ok:false,message:'You can remove Preferred Books only for subjects assigned to your employee account.'});}
     const result=await pool.query('DELETE FROM preferred_books WHERE preferred_book_id=$1 RETURNING preferred_book_id',[id]);
     if(!result.rowCount)return res.status(404).json({ok:false,message:'Preferred book not found.'});res.json({ok:true,message:'Preferred book removed successfully.'});}
@@ -2159,7 +2110,7 @@ app.delete('/api/preferred-books/:id', authenticate, async (req,res)=>{
 
 app.get('/api/subject-teacher-allocations', authenticate, async (_req,res)=>{
   try{
-    const [academicYears,batches,semesters,sections,subjects,teachers,allocations]=await Promise.all([
+    const [academicYears,batches,semesters,sections,subjects,teachers,allocations,semesterDefinitions]=await Promise.all([
       pool.query(`SELECT academic_year_id AS id,year_label AS name,is_current FROM academic_years
         WHERE is_active=TRUE ORDER BY is_current DESC,start_date DESC`),
       pool.query(`SELECT b.batch_id AS id,b.programme_id,b.batch_name AS name,p.programme_code,p.programme_name
@@ -2171,7 +2122,7 @@ app.get('/api/subject-teacher-allocations', authenticate, async (_req,res)=>{
         COALESCE(sm.section_master_name,s.section_name) AS name
         FROM sections s LEFT JOIN section_masters sm ON sm.section_master_id=s.section_master_id
         WHERE s.is_active=TRUE ORDER BY s.batch_id,s.section_name`),
-      pool.query(`SELECT subject_master_id AS id,subject_code AS code,subject_name AS name,department_id
+      pool.query(`SELECT subject_master_id AS id,subject_code AS code,subject_name AS name,department_id,programme_id,semester_id
         FROM subject_masters WHERE is_active=TRUE ORDER BY subject_name`),
       pool.query(`SELECT e.employee_id AS id,e.employee_code AS code,
         TRIM(CONCAT(e.first_name,' ',e.middle_name,' ',e.last_name)) AS name,e.department_id
@@ -2189,10 +2140,11 @@ app.get('/api/subject-teacher-allocations', authenticate, async (_req,res)=>{
         JOIN semesters se ON se.semester_id=a.semester_id JOIN sections s ON s.section_id=a.section_id
         LEFT JOIN section_masters sec ON sec.section_master_id=s.section_master_id
         JOIN subject_masters sm ON sm.subject_master_id=a.subject_master_id
-        JOIN employees e ON e.employee_id=a.employee_id ORDER BY a.created_at DESC`)
+        JOIN employees e ON e.employee_id=a.employee_id ORDER BY a.created_at DESC`),
+      pool.query("SELECT course_id,programme_batch_id,semester_id FROM programme_semester_definitions WHERE is_active=TRUE AND class_type='SECTION' ORDER BY COALESCE(updated_at,created_at) DESC,programme_semester_id DESC")
     ]);
     res.json({ok:true,academicYears:academicYears.rows,batches:batches.rows,semesters:semesters.rows,
-      sections:sections.rows,subjects:subjects.rows,teachers:teachers.rows,allocations:allocations.rows});
+      sections:sections.rows,subjects:subjects.rows,teachers:teachers.rows,allocations:allocations.rows,semesterDefinitions:semesterDefinitions.rows});
   }catch(error){console.error('Subject teacher allocation query error:',error.message);res.status(500).json({ok:false,message:'Unable to load subject teacher allocations.'});}
 });
 
@@ -2200,6 +2152,7 @@ app.post('/api/subject-teacher-allocations', authenticate, async (req,res)=>{
   const data=req.body,ids=[data.academicYearId,data.batchId,data.semesterId,data.sectionId,data.subjectId,data.employeeId];
   if(!ids.every(value=>Number(value))||!['PRIMARY','CO_TEACHER','LAB'].includes(data.role)||Number(data.hours)<=0)return res.status(400).json({ok:false,message:'Select all allocation fields and enter valid workload hours.'});
   try{
+    if(!await subjectMatchesAllocation(pool,data))return res.status(400).json({ok:false,message:'Select a subject belonging to the chosen Programme and Semester, with a matching Section.'});
     const result=await pool.query(`INSERT INTO subject_teacher_allocations
       (academic_year_id,batch_id,semester_id,section_id,subject_master_id,employee_id,allocation_role,workload_hours,created_by)
       SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9
@@ -2216,7 +2169,8 @@ app.post('/api/subject-teacher-allocations', authenticate, async (req,res)=>{
 app.put('/api/subject-teacher-allocations/:id', authenticate, async (req,res)=>{
   const id=Number(req.params.id),data=req.body,ids=[data.academicYearId,data.batchId,data.semesterId,data.sectionId,data.subjectId,data.employeeId];
   if(!id||!ids.every(value=>Number(value))||!['PRIMARY','CO_TEACHER','LAB'].includes(data.role)||Number(data.hours)<=0)return res.status(400).json({ok:false,message:'Select all allocation fields and enter valid workload hours.'});
-  try{const result=await pool.query(`UPDATE subject_teacher_allocations SET academic_year_id=$1,batch_id=$2,
+  try{if(!await subjectMatchesAllocation(pool,data))return res.status(400).json({ok:false,message:'Select a subject belonging to the chosen Programme and Semester, with a matching Section.'});
+    const result=await pool.query(`UPDATE subject_teacher_allocations SET academic_year_id=$1,batch_id=$2,
     semester_id=$3,section_id=$4,subject_master_id=$5,employee_id=$6,allocation_role=$7,
     workload_hours=$8,status='ACTIVE',updated_by=$9,updated_at=NOW() WHERE subject_teacher_allocation_id=$10
     RETURNING subject_teacher_allocation_id`,[...ids.map(Number),data.role,Number(data.hours),req.auth.userId,id]);
@@ -2244,33 +2198,24 @@ app.post('/api/subject-teacher-allocations/:id/restore', authenticate, async (re
 
 app.get('/api/class-teacher-allocations', authenticate, async (_req,res)=>{
   try{
-    const [academicYears,programmes,batches,semesters,sections,groups,teachers,allocations]=await Promise.all([
+    const [academicYears,programmes,batches,semesters,sections,groups,teachers,allocations,subjects,semesterDefinitions,teacherAssignments]=await Promise.all([
       pool.query(`SELECT academic_year_id AS id,year_label AS name,is_current FROM academic_years WHERE is_active=TRUE ORDER BY is_current DESC,start_date DESC`),
       pool.query(`SELECT programme_id AS id,programme_code AS code,programme_name AS name FROM programmes WHERE is_active=TRUE ORDER BY programme_name`),
-      pool.query(`SELECT batch_id AS id,programme_id,batch_name AS name FROM admission_batches WHERE is_active=TRUE ORDER BY admission_year DESC,batch_name`),
+      pool.query(`SELECT batch_id AS id,programme_id,batch_name AS name,(SELECT academic_year_id FROM academic_years WHERE EXTRACT(YEAR FROM start_date)=admission_year ORDER BY academic_year_id LIMIT 1) AS academic_year_id FROM admission_batches WHERE is_active=TRUE ORDER BY admission_year DESC,batch_name`),
       pool.query(`SELECT semester_id AS id,programme_id,semester_name AS name,semester_number FROM semesters WHERE is_active=TRUE ORDER BY programme_id,semester_number`),
       pool.query(`SELECT s.section_id AS id,s.batch_id,s.semester_id,COALESCE(sm.section_master_name,s.section_name) AS name FROM sections s LEFT JOIN section_masters sm ON sm.section_master_id=s.section_master_id WHERE s.is_active=TRUE ORDER BY name`),
       pool.query(`SELECT DISTINCT UPPER(TRIM(student_group)) AS name FROM students WHERE NULLIF(TRIM(student_group),'') IS NOT NULL AND COALESCE(is_deleted,FALSE)=FALSE ORDER BY name`),
       pool.query(`SELECT e.employee_id AS id,e.employee_code AS code,TRIM(CONCAT_WS(' ',e.first_name,e.middle_name,e.last_name)) AS name FROM employees e LEFT JOIN designations d ON d.designation_id=e.designation_id WHERE e.status='ACTIVE' AND COALESCE(d.designation_type,'TEACHING')='TEACHING' ORDER BY name`),
-      pool.query(`SELECT a.class_teacher_allocation_id AS id,a.academic_year_id,a.programme_id,a.batch_id,a.semester_id,a.section_id,a.student_group,a.employee_id,a.teacher_type,a.status,ay.year_label AS academic_year,p.programme_code,p.programme_name,b.batch_name,se.semester_name,COALESCE(sm.section_master_name,s.section_name) AS section_name,TRIM(CONCAT_WS(' ',e.first_name,e.middle_name,e.last_name)) AS teacher_name,(SELECT COUNT(*)::int FROM students st WHERE st.section_id=a.section_id AND COALESCE(st.is_deleted,FALSE)=FALSE AND (a.student_group='ALL' OR UPPER(COALESCE(st.student_group,''))=a.student_group)) AS student_count FROM class_teacher_allocations a JOIN academic_years ay ON ay.academic_year_id=a.academic_year_id JOIN programmes p ON p.programme_id=a.programme_id JOIN admission_batches b ON b.batch_id=a.batch_id JOIN semesters se ON se.semester_id=a.semester_id JOIN sections s ON s.section_id=a.section_id LEFT JOIN section_masters sm ON sm.section_master_id=s.section_master_id JOIN employees e ON e.employee_id=a.employee_id ORDER BY a.created_at DESC`)
+      pool.query(`SELECT a.class_teacher_allocation_id AS id,a.academic_year_id,a.programme_id,a.batch_id,a.semester_id,a.section_id,a.student_group,a.employee_id,a.teacher_type,a.status,a.subject_master_id,subject.subject_code,subject.subject_name,ay.year_label AS academic_year,p.programme_code,p.programme_name,b.batch_name,se.semester_name,COALESCE(sm.section_master_name,s.section_name) AS section_name,TRIM(CONCAT_WS(' ',e.first_name,e.middle_name,e.last_name)) AS teacher_name,(SELECT COUNT(*)::int FROM students st WHERE st.section_id=a.section_id AND COALESCE(st.is_deleted,FALSE)=FALSE AND (a.student_group='ALL' OR UPPER(COALESCE(st.student_group,''))=a.student_group)) AS student_count FROM class_teacher_allocations a LEFT JOIN subject_masters subject ON subject.subject_master_id=a.subject_master_id JOIN academic_years ay ON ay.academic_year_id=a.academic_year_id JOIN programmes p ON p.programme_id=a.programme_id JOIN admission_batches b ON b.batch_id=a.batch_id JOIN semesters se ON se.semester_id=a.semester_id JOIN sections s ON s.section_id=a.section_id LEFT JOIN section_masters sm ON sm.section_master_id=s.section_master_id JOIN employees e ON e.employee_id=a.employee_id ORDER BY a.created_at DESC`),
+      pool.query("SELECT subject_master_id AS id,programme_id,semester_id,subject_code AS code,subject_name AS name FROM subject_masters WHERE is_active=TRUE ORDER BY subject_code"),
+      pool.query("SELECT programme_batch_id,semester_id FROM programme_semester_definitions WHERE is_active=TRUE AND class_type='SECTION' ORDER BY COALESCE(updated_at,created_at) DESC,programme_semester_id DESC"),
+      pool.query("SELECT academic_year_id,batch_id,semester_id,section_id,subject_master_id,employee_id FROM subject_teacher_allocations WHERE status='ACTIVE'")
     ]);
-    res.json({ok:true,academicYears:academicYears.rows,programmes:programmes.rows,batches:batches.rows,semesters:semesters.rows,sections:sections.rows,groups:groups.rows,teachers:teachers.rows,allocations:allocations.rows});
+    res.json({ok:true,academicYears:academicYears.rows,programmes:programmes.rows,batches:batches.rows,semesters:semesters.rows,sections:sections.rows,groups:groups.rows,teachers:teachers.rows,allocations:allocations.rows,subjects:subjects.rows,semesterDefinitions:semesterDefinitions.rows,teacherAssignments:teacherAssignments.rows});
   }catch(error){console.error('Class teacher allocation query error:',error.message);res.status(500).json({ok:false,message:'Unable to load class teacher allocations.'});}
 });
 
-app.post('/api/class-teacher-allocations', authenticate, async (req,res)=>{
-  const d=req.body,ids=[d.academicYearId,d.programmeId,d.batchId,d.semesterId,d.sectionId,d.employeeId],group=String(d.studentGroup||'ALL').trim().toUpperCase();
-  if(!ids.every(Number)||!['MAIN','ASSISTANT'].includes(d.teacherType)||!group)return res.status(400).json({ok:false,message:'Select all required class teacher fields.'});
-  try{const result=await pool.query(`INSERT INTO class_teacher_allocations (academic_year_id,programme_id,batch_id,semester_id,section_id,student_group,employee_id,teacher_type,created_by) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9 WHERE EXISTS (SELECT 1 FROM sections s JOIN admission_batches b ON b.batch_id=s.batch_id JOIN semesters se ON se.semester_id=s.semester_id WHERE s.section_id=$5 AND b.batch_id=$3 AND b.programme_id=$2 AND se.semester_id=$4 AND se.programme_id=$2) ON CONFLICT (academic_year_id,batch_id,semester_id,section_id,student_group) DO UPDATE SET employee_id=EXCLUDED.employee_id,teacher_type=EXCLUDED.teacher_type,programme_id=EXCLUDED.programme_id,status='ACTIVE',updated_by=$9,updated_at=NOW() RETURNING class_teacher_allocation_id`,[...ids.slice(0,5).map(Number),group,Number(d.employeeId),d.teacherType,req.auth.userId]);if(!result.rowCount)return res.status(400).json({ok:false,message:'The selected course, batch, semester, and section do not belong together.'});res.status(201).json({ok:true,message:'Class teacher assigned successfully.'});}
-  catch(error){res.status(error.code==='23503'?400:500).json({ok:false,message:error.code==='23503'?'One of the selected records is invalid.':'Unable to assign class teacher.'});}
-});
-
-app.put('/api/class-teacher-allocations/:id', authenticate, async (req,res)=>{
-  const id=Number(req.params.id),d=req.body,ids=[d.academicYearId,d.programmeId,d.batchId,d.semesterId,d.sectionId,d.employeeId],group=String(d.studentGroup||'ALL').trim().toUpperCase();
-  if(!id||!ids.every(Number)||!['MAIN','ASSISTANT'].includes(d.teacherType)||!group)return res.status(400).json({ok:false,message:'Select all required class teacher fields.'});
-  try{const result=await pool.query(`UPDATE class_teacher_allocations SET academic_year_id=$1,programme_id=$2,batch_id=$3,semester_id=$4,section_id=$5,student_group=$6,employee_id=$7,teacher_type=$8,status='ACTIVE',updated_by=$9,updated_at=NOW() WHERE class_teacher_allocation_id=$10 RETURNING class_teacher_allocation_id`,[...ids.slice(0,5).map(Number),group,Number(d.employeeId),d.teacherType,req.auth.userId,id]);if(!result.rowCount)return res.status(404).json({ok:false,message:'Class teacher allocation not found.'});res.json({ok:true,message:'Class teacher allocation updated successfully.'});}
-  catch(error){res.status(error.code==='23505'?409:500).json({ok:false,message:error.code==='23505'?'A class teacher is already assigned to this class and group.':'Unable to update class teacher.'});}
-});
+registerClassTeacherSubjectSave(app,pool,authenticate);
 
 app.delete('/api/class-teacher-allocations/:id', authenticate, async (req,res)=>{
   try{const result=await pool.query(`UPDATE class_teacher_allocations SET status='INACTIVE',updated_by=$1,updated_at=NOW() WHERE class_teacher_allocation_id=$2 RETURNING class_teacher_allocation_id`,[req.auth.userId,Number(req.params.id)]);if(!result.rowCount)return res.status(404).json({ok:false,message:'Class teacher allocation not found.'});res.json({ok:true,message:'Class teacher allocation removed successfully.'});}catch(error){res.status(500).json({ok:false,message:'Unable to remove class teacher allocation.'});}
@@ -2343,21 +2288,22 @@ async function validateProgrammeSemesterDefinition(client,data){
 
 app.post('/api/programme-semester-definitions', authenticate, async (req,res)=>{
   const client=await pool.connect();
-  try{const data=await validateProgrammeSemesterDefinition(client,req.body);const result=await client.query(`INSERT INTO programme_semester_definitions
+  try{await client.query('BEGIN');const data=await validateProgrammeSemesterDefinition(client,req.body);const result=await client.query(`INSERT INTO programme_semester_definitions
     (course_id,programme_batch_id,semester_id,class_type,is_active,consider_for_accounting,created_by)
     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING programme_semester_id`,[data.courseId,data.batchId,data.semesterId,data.classType,data.isActive,data.considerForAccounting,req.auth.userId]);
+    await client.query(definedSemesterSectionsSql);await client.query('COMMIT');
     res.status(201).json({ok:true,id:result.rows[0].programme_semester_id,message:'Semester definition created successfully.'});
-  }catch(error){res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'This Course, Batch, Semester, and Class Type combination already exists.':error.message});}finally{client.release();}
+  }catch(error){await client.query('ROLLBACK');res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'This Course, Batch, Semester, and Class Type combination already exists.':error.message});}finally{client.release();}
 });
 
 app.put('/api/programme-semester-definitions/:id', authenticate, async (req,res)=>{
   const id=Number(req.params.id),client=await pool.connect();
-  try{if(!id)throw new Error('Invalid semester definition.');const data=await validateProgrammeSemesterDefinition(client,req.body);const result=await client.query(`UPDATE programme_semester_definitions SET
+  try{await client.query('BEGIN');if(!id)throw new Error('Invalid semester definition.');const data=await validateProgrammeSemesterDefinition(client,req.body);const result=await client.query(`UPDATE programme_semester_definitions SET
     course_id=$1,programme_batch_id=$2,semester_id=$3,class_type=$4,is_active=$5,
     consider_for_accounting=$6,updated_by=$7,updated_at=NOW() WHERE programme_semester_id=$8 RETURNING programme_semester_id`,
     [data.courseId,data.batchId,data.semesterId,data.classType,data.isActive,data.considerForAccounting,req.auth.userId,id]);
-    if(!result.rowCount)return res.status(404).json({ok:false,message:'Semester definition not found.'});res.json({ok:true,message:'Semester definition updated successfully.'});
-  }catch(error){res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'This Course, Batch, Semester, and Class Type combination already exists.':error.message});}finally{client.release();}
+    if(!result.rowCount){await client.query('ROLLBACK');return res.status(404).json({ok:false,message:'Semester definition not found.'});}await client.query(definedSemesterSectionsSql);await client.query('COMMIT');res.json({ok:true,message:'Semester definition updated successfully.'});
+  }catch(error){await client.query('ROLLBACK');res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'This Course, Batch, Semester, and Class Type combination already exists.':error.message});}finally{client.release();}
 });
 
 app.delete('/api/programme-semester-definitions/:id', authenticate, async (req,res)=>{
@@ -2714,34 +2660,7 @@ app.post('/api/programme-sections/split', authenticate, async (req,res)=>{
   }catch(error){await client.query('ROLLBACK');res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'One of the new sections already exists for this semester.':error.message});}finally{client.release();}
 });
 
-app.get('/api/section-masters', authenticate, async (_req,res)=>{
-  try{const result=await pool.query(`SELECT section_master_id AS id,section_master_code AS code,
-    section_master_name AS name,is_active FROM section_masters ORDER BY section_master_name`);
-    res.json({ok:true,sections:result.rows});}
-  catch(error){res.status(500).json({ok:false,message:'Unable to load section masters.'});}
-});
-
-app.post('/api/section-masters', authenticate, async (req,res)=>{
-  const name=req.body.name?.trim();if(!name)return res.status(400).json({ok:false,message:'Section Master Name is required.'});
-  try{const result=await pool.query(`INSERT INTO section_masters
-    (section_master_code,section_master_name,created_by) VALUES ($1,$2,$3) RETURNING section_master_id,section_master_code`,
-    [sectionMasterCode(name),name,req.auth.userId]);res.status(201).json({ok:true,id:result.rows[0].section_master_id,code:result.rows[0].section_master_code,message:'Section Master created successfully.'});}
-  catch(error){res.status(error.code==='23505'?409:500).json({ok:false,message:error.code==='23505'?'Section Master code or name already exists.':'Unable to create Section Master.'});}
-});
-
-app.put('/api/section-masters/:id', authenticate, async (req,res)=>{
-  const id=Number(req.params.id),name=req.body.name?.trim();if(!id||!name)return res.status(400).json({ok:false,message:'Section Master Name is required.'});
-  try{const result=await pool.query(`UPDATE section_masters SET section_master_code=$1,
-    section_master_name=$2,updated_at=NOW(),updated_by=$3 WHERE section_master_id=$4 RETURNING section_master_id`,
-    [sectionMasterCode(name),name,req.auth.userId,id]);if(!result.rowCount)return res.status(404).json({ok:false,message:'Section Master not found.'});res.json({ok:true,message:'Section Master updated successfully.'});}
-  catch(error){res.status(error.code==='23505'?409:500).json({ok:false,message:error.code==='23505'?'Section Master code or name already exists.':'Unable to update Section Master.'});}
-});
-
-app.delete('/api/section-masters/:id', authenticate, async (req,res)=>{
-  const id=Number(req.params.id);if(!id)return res.status(400).json({ok:false,message:'Invalid Section Master.'});
-  try{const result=await pool.query('DELETE FROM section_masters WHERE section_master_id=$1 RETURNING section_master_id',[id]);if(!result.rowCount)return res.status(404).json({ok:false,message:'Section Master not found.'});res.json({ok:true,message:'Section Master deleted successfully.'});}
-  catch(error){res.status(error.code==='23503'?409:500).json({ok:false,message:error.code==='23503'?'This Section Master is in use and cannot be deleted.':'Unable to delete Section Master.'});}
-});
+registerSectionMasterRoutes(app,pool,authenticate);
 
 app.get('/api/students/form-options', authenticate, async (_req,res)=>{
   try{
@@ -2749,7 +2668,7 @@ app.get('/api/students/form-options', authenticate, async (_req,res)=>{
       pool.query('SELECT department_id AS id,department_code AS code,department_name AS name FROM departments WHERE is_active=TRUE ORDER BY department_name'),
       pool.query('SELECT programme_id AS id,department_id,programme_code AS code,programme_name AS name FROM programmes WHERE is_active=TRUE ORDER BY programme_name'),
       pool.query('SELECT branch_id AS id,department_id,programme_id,branch_code AS code,branch_name AS name FROM student_branches WHERE is_active=TRUE ORDER BY branch_name'),
-      pool.query('SELECT academic_year_id AS id,year_label AS code,COALESCE(academic_year_name,year_label) AS name FROM academic_years WHERE is_active=TRUE ORDER BY start_date DESC'),
+      pool.query('SELECT academic_year_id AS id,year_label AS code,COALESCE(academic_year_name,year_label) AS name,start_date::text,end_date::text FROM academic_years WHERE is_active=TRUE ORDER BY start_date DESC'),
       pool.query('SELECT batch_id AS id,programme_id,batch_name AS name,admission_year FROM admission_batches WHERE is_active=TRUE ORDER BY admission_year DESC'),
       pool.query('SELECT semester_id AS id,programme_id,semester_number AS number,semester_name AS name FROM semesters WHERE is_active=TRUE ORDER BY semester_number'),
       pool.query('SELECT section_id AS id,semester_id,section_name AS name FROM sections WHERE is_active=TRUE ORDER BY section_name'),
@@ -2836,6 +2755,10 @@ app.post('/api/students', authenticate, async (req,res)=>{
   catch(error){await client.query('ROLLBACK');res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'Admission, registration, or roll number already exists.':error.message});}finally{client.release();}
 });
 
+app.get('/api/students/admission-template', authenticate, async (req,res)=>{
+  try{const result=await pool.query(`SELECT COALESCE(NULLIF(st.registration_number,''),st.registration_no) AS "registrationNumber",p.programme_code AS programme,ay.year_label AS "academicYear",TRIM(CONCAT(st.first_name,' ',st.middle_name,' ',st.last_name)) AS "studentName",st.admission_type AS "admissionType",ac.category_name AS "admissionCategory",st.gender,st.date_of_birth::text AS "dateOfBirth",st.blood_group AS "bloodGroup",st.student_profile_details->>'religion' AS religion,st.category,st.email,sp.father_name AS "fatherName",sp.mother_name AS "motherName",sp.guardian_mobile AS "guardianMobile",st.current_address AS "presentAddress",st.permanent_address AS "permanentAddress" FROM students st JOIN programmes p ON p.programme_id=st.programme_id JOIN academic_years ay ON ay.academic_year_id=st.academic_year_id LEFT JOIN admission_categories ac ON ac.admission_category_id=st.admission_category_id LEFT JOIN student_parents sp ON sp.student_id=st.student_id WHERE COALESCE(st.is_deleted,FALSE)=FALSE AND NULLIF(COALESCE(NULLIF(st.registration_number,''),st.registration_no),'') IS NOT NULL ORDER BY st.student_id`);res.json({ok:true,rows:result.rows});}catch(error){res.status(500).json({ok:false,message:'Unable to load student template data.'});}
+});
+
 app.post('/api/students/bulk', authenticate, async (req,res)=>{
   const rows=Array.isArray(req.body.rows)?req.body.rows:[];if(!rows.length||rows.length>500)return res.status(400).json({ok:false,message:'Upload between 1 and 500 student rows.'});
   const client=await pool.connect();
@@ -2852,14 +2775,15 @@ app.post('/api/students/bulk', authenticate, async (req,res)=>{
     const match=(items,value,keys=['code','name'])=>{const wanted=normalize(value);return wanted?items.find(item=>keys.some(key=>normalize(item[key])===wanted)):null;};
     for(let index=0;index<rows.length;index++){
       const row=rows[index],rowNumber=index+2;
-      if(!String(row.admissionNumber||'').trim())throw new Error(`Row ${rowNumber}: Admission No is required.`);
+      if(!String(row.registrationNumber||row.admissionNumber||'').trim())throw new Error(`Row ${rowNumber}: Registration No is required.`);
       if(!String(row.studentName||'').trim())throw new Error(`Row ${rowNumber}: Student Name is required.`);
       let admissionDate,dateOfBirth;
       try{
         admissionDate=normalizeDateInput(row.admissionDate,'Admission Date');
         dateOfBirth=normalizeDateInput(row.dateOfBirth,'Date of Birth');
       }catch(error){throw new Error(`Row ${rowNumber}: ${error.message}`);}
-      const department=match(departmentRows.rows,row.department);
+      const programmeMatch=match(programmeRows.rows,row.programme);
+      const department=row.department?match(departmentRows.rows,row.department):departmentRows.rows.find(item=>Number(item.id)===Number(programmeMatch?.department_id));
       if(!department)throw new Error(`Row ${rowNumber}: Department "${row.department||'(blank)'}" was not found. Use an active department code or exact name.`);
       const departmentProgrammes=programmeRows.rows.filter(item=>Number(item.department_id)===Number(department.id));
       let programme=match(departmentProgrammes,row.programme);
@@ -2883,8 +2807,19 @@ app.post('/api/students/bulk', authenticate, async (req,res)=>{
       if(semesterValue&&!semester)throw new Error(`Row ${rowNumber}: Semester "${row.semester}" was not found for programme "${row.programme}". Leave it blank to configure separately, or use a configured semester number/name.`);
       const category=row.admissionCategory?match(categoryRows.rows,row.admissionCategory):null;
       if(row.admissionCategory&&!category)throw new Error(`Row ${rowNumber}: Admission Category "${row.admissionCategory}" was not found.`);
+      if(row.email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(row.email)))throw new Error(`Row ${rowNumber}: E mail is invalid.`);
+      if(dateOfBirth&&dateOfBirth>=new Date().toISOString().slice(0,10))throw new Error(`Row ${rowNumber}: DOB must be before today.`);
+      if(row.gender){const gender=['Male','Female','Other'].find(value=>value.toLowerCase()===String(row.gender).toLowerCase());if(!gender)throw new Error(`Row ${rowNumber}: Gender must be Male, Female or Other.`);row.gender=gender;}
       const departmentId=department.id,programmeId=programme.id,academicYearId=academicYear.id,semesterId=semester?.id||null,categoryId=category?.id||null;
-      await insertStudent(client,{...row,admissionDate,dateOfBirth,departmentId,programmeId,academicYearId,semesterId,admissionCategoryId:categoryId},req.auth.userId);
+      const existing=req.body.updateExisting===true?(await client.query(`SELECT student_id,programme_id,academic_year_id,first_name,middle_name,last_name FROM students WHERE LOWER(COALESCE(NULLIF(registration_number,''),registration_no))=LOWER($1) AND COALESCE(is_deleted,FALSE)=FALSE FOR UPDATE`,[String(row.registrationNumber||'').trim()])).rows:[];
+      if(existing.length>1)throw new Error(`Row ${rowNumber}: Registration No matches multiple students.`);
+      if(existing.length){const student=existing[0],savedName=[student.first_name,student.middle_name,student.last_name].filter(Boolean).join(' ');
+        if(Number(student.programme_id)!==Number(programmeId)||Number(student.academic_year_id)!==Number(academicYearId)||normalize(savedName)!==normalize(row.studentName))throw new Error(`Row ${rowNumber}: The red columns must match the existing student record.`);
+        await client.query(`UPDATE students SET admission_type=$1,admission_category_id=$2,gender=$3,date_of_birth=$4,blood_group=$5,category=$6,email=$7,current_address=$8,permanent_address=$9,student_profile_details=student_profile_details||$10::jsonb,updated_at=NOW(),updated_by=$11 WHERE student_id=$12`,[row.admissionType||null,categoryId,row.gender||null,dateOfBirth,row.bloodGroup||null,row.category||null,row.email||null,row.presentAddress||null,row.permanentAddress||null,JSON.stringify(row),req.auth.userId,student.student_id]);
+        const parents=await client.query('UPDATE student_parents SET father_name=$1,mother_name=$2,guardian_mobile=$3 WHERE student_id=$4',[row.fatherName||null,row.motherName||null,row.guardianMobile||null,student.student_id]);
+        if(!parents.rowCount)await client.query('INSERT INTO student_parents(student_id,father_name,mother_name,guardian_mobile) VALUES($1,$2,$3,$4)',[student.student_id,row.fatherName||null,row.motherName||null,row.guardianMobile||null]);
+        for(const [type,address] of [['Present',row.presentAddress],['Permanent',row.permanentAddress]]){const updated=await client.query('UPDATE student_addresses SET address_line1=$1 WHERE student_id=$2 AND address_type=$3',[address||'',student.student_id,type]);if(!updated.rowCount&&address)await client.query('INSERT INTO student_addresses(student_id,address_type,address_line1) VALUES($1,$2,$3)',[student.student_id,type,address]);}
+      }else {if(req.body.updateExisting===true)throw new Error(`Row ${rowNumber}: Registration No was not found in student records.`);if(!String(row.admissionNumber||'').trim())throw new Error(`Row ${rowNumber}: Add a student using Import Student first, then complete their profile here.`);await insertStudent(client,{...row,admissionDate,dateOfBirth,departmentId,programmeId,academicYearId,semesterId,admissionCategoryId:categoryId},req.auth.userId);}
     }
     await client.query('COMMIT');res.status(201).json({ok:true,message:`${rows.length} students imported successfully.`});
   }catch(error){await client.query('ROLLBACK');res.status(error.code==='23505'?409:400).json({ok:false,message:error.code==='23505'?'The file contains a duplicate student number.':error.message});}finally{client.release();}
@@ -2931,6 +2866,9 @@ app.get('/api/students-management/:id', authenticate, async (req,res)=>{
     res.json({ok:true,student:result.rows[0]});
   }catch(error){console.error('Student detail error:',error.message);res.status(500).json({ok:false,message:'Unable to load student details.'});}
 });
+
+registerStudentProfile(app,pool,authenticate);
+registerMentoringRedesign(app,pool,authenticate);
 
 app.put('/api/students-management/:id', authenticate, async (req,res)=>{
   const id=Number(req.params.id),name=String(req.body.studentName||'').trim(),mobile=String(req.body.mobile||'').trim(),email=String(req.body.email||'').trim();
@@ -3005,7 +2943,7 @@ app.post('/api/students-password-reset/:id', authenticate, async (req,res)=>{
 
 app.get('/api/students-restore', authenticate, async (_req,res)=>{
   try{const result=await pool.query(`SELECT st.student_id AS id,COALESCE(st.registration_number,st.student_code) AS student_code,
-    st.first_name,st.last_name,COALESCE(sm.section_master_name,s.section_name) AS section_name,
+    st.first_name,st.middle_name,st.last_name,COALESCE(sm.section_master_name,s.section_name) AS section_name,
     ab.batch_name,p.programme_name,st.deleted_at,st.deletion_reason
     FROM students st JOIN programmes p ON p.programme_id=st.programme_id
     JOIN admission_batches ab ON ab.batch_id=st.batch_id LEFT JOIN sections s ON s.section_id=st.section_id
@@ -3627,27 +3565,18 @@ app.post('/api/employees-restore/:id', authenticate, async (req,res)=>{
 
 app.get('/api/employees/:id', authenticate, async (req,res)=>{
   const id=Number(req.params.id);if(!id)return res.status(400).json({ok:false,message:'Invalid employee.'});
-  try{const result=await pool.query(`SELECT e.*,e.employee_id AS id,e.employee_code AS code,
+  try{const result=await pool.query(`SELECT e.*,e.date_of_birth::text AS date_of_birth,e.date_of_joining::text AS date_of_joining,e.employee_id AS id,e.employee_code AS code,
     TRIM(CONCAT_WS(' ',e.first_name,e.middle_name,e.last_name)) AS name,
     d.department_name AS department,d.department_code,dg.designation_name AS designation,
     c.campus_name FROM employees e LEFT JOIN departments d ON d.department_id=e.department_id
     LEFT JOIN designations dg ON dg.designation_id=e.designation_id
     LEFT JOIN campuses c ON c.campus_id=e.campus_id WHERE e.employee_id=$1`,[id]);
-    if(!result.rowCount)return res.status(404).json({ok:false,message:'Employee not found.'});res.json({ok:true,employee:result.rows[0]});}
+    if(!result.rowCount)return res.status(404).json({ok:false,message:'Employee not found.'});const [departments,designations,campuses]=await Promise.all([pool.query('SELECT department_name AS name,is_active FROM departments ORDER BY department_name'),pool.query('SELECT designation_name AS name,is_active FROM designations ORDER BY designation_name'),pool.query('SELECT campus_name AS name,is_active FROM campuses ORDER BY campus_name')]);res.json({ok:true,employee:result.rows[0],masters:{departments:departments.rows,designations:designations.rows,campuses:campuses.rows}});}
   catch(error){res.status(500).json({ok:false,message:'Unable to load employee details.'});}
 });
 
-app.put('/api/employees/:id', authenticate, async (req,res)=>{
-  const id=Number(req.params.id),data=req.body;if(!id||!String(data.firstName||'').trim())return res.status(400).json({ok:false,message:'First name is required.'});
-  try{const result=await pool.query(`UPDATE employees SET first_name=$1,middle_name=$2,last_name=$3,gender=$4,
-    date_of_birth=$5,date_of_joining=$6,blood_group=$7,marital_status=$8,mobile=$9,official_email=$10,
-    personal_email=$11,address=$12,permanent_address=$13,employee_category=$14,status=$15,photo_url=COALESCE($16,photo_url) WHERE employee_id=$17 RETURNING employee_id`,
-    [data.firstName.trim(),data.middleName?.trim()||null,data.lastName?.trim()||null,data.gender||null,data.dateOfBirth||null,
-      data.joiningDate||null,data.bloodGroup||null,data.maritalStatus||null,data.mobile?.trim()||null,data.officialEmail?.trim()||null,
-      data.personalEmail?.trim()||null,data.address?.trim()||null,data.permanentAddress?.trim()||null,data.category||null,data.status||'ACTIVE',data.photoUrl||null,id]);
-    if(!result.rowCount)return res.status(404).json({ok:false,message:'Employee not found.'});res.json({ok:true,message:'Employee updated successfully.'});}
-  catch(error){res.status(500).json({ok:false,message:'Unable to update employee.'});}
-});
+registerEmployeeUpdateRoute(app,pool,authenticate);
+registerStudentImportRoute(app,pool,authenticate,insertStudent);
 
 app.delete('/api/employees/:id', authenticate, async (req,res)=>{
   const id=Number(req.params.id);if(!id)return res.status(400).json({ok:false,message:'Invalid employee.'});
@@ -5147,7 +5076,8 @@ app.get('/api/mentoring-existing-student-options', authenticate, async (_req,res
 
 app.get('/api/mentoring-existing-students', authenticate, async (req,res)=>{
   try{
-    const values=[],where=["sma.allotment_status='Active'"];
+    const values=[],where=["sma.allotment_status='Active'","COALESCE(st.is_deleted,FALSE)=FALSE"];
+    if(!['ADMIN','SUPER_ADMIN','INSTITUTE_ADMIN'].includes(req.auth.role)){values.push(req.auth.userId);where.push(`m.employee_id=(SELECT employee_id FROM employees WHERE user_id=$${values.length} LIMIT 1)`);}
     const add=(value,column)=>{if(value){values.push(value);where.push(`${column}=$${values.length}`);}};
     add(req.query.academicYearId,'sma.academic_year_id');add(req.query.programmeId,'sma.programme_id');
     add(req.query.batchId,'sma.programme_batch_id');add(req.query.semesterId,'sma.semester_id');
@@ -5188,7 +5118,7 @@ app.get('/api/mentoring-existing-students', authenticate, async (req,res)=>{
 
 app.post('/api/student-counsellings', authenticate, async (req,res)=>{
   try{
-    const data=req.body||{};
+    const data={...req.body,discussionDate:mentoringToday()};
     if(!data.academicYearId||!data.studentId||!data.mentorId||!data.discussionDate||!data.communicationMode||!data.purpose||!data.detailedDiscussion?.trim())
       return res.status(400).json({ok:false,message:'Complete all required counselling fields.'});
     if(data.followUpRequired&&!data.nextFollowUpDate)return res.status(400).json({ok:false,message:'Next follow-up date is required.'});
@@ -5196,10 +5126,11 @@ app.post('/api/student-counsellings', authenticate, async (req,res)=>{
       WHERE academic_year_id=$1 AND student_id=$2 AND mentor_id=$3 AND allotment_status='Active'`,
       [Number(data.academicYearId),Number(data.studentId),Number(data.mentorId)]);
     if(!active.rowCount)return res.status(409).json({ok:false,message:'The student is not actively allotted to this mentor.'});
+    if(!(await pool.query('SELECT 1 FROM mentoring.counselling_purposes WHERE purpose_name=$1 AND is_active=TRUE',[data.purpose])).rowCount)return res.status(400).json({ok:false,message:'Select a configured counselling purpose.'});
     await pool.query(`INSERT INTO mentoring.student_counsellings
       (academic_year_id,student_id,mentor_id,discussion_date,communication_mode,purpose,detailed_discussion,
-       mentor_remarks,follow_up_required,next_follow_up_date,counselling_status,created_by)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       mentor_remarks,follow_up_required,next_follow_up_date,counselling_status,created_by,counselling_purpose_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,(SELECT counselling_purpose_id FROM mentoring.counselling_purposes WHERE purpose_name=$6 AND is_active=TRUE LIMIT 1))`,
       [Number(data.academicYearId),Number(data.studentId),Number(data.mentorId),data.discussionDate,data.communicationMode,
        data.purpose,data.detailedDiscussion.trim(),data.mentorRemarks?.trim()||null,Boolean(data.followUpRequired),
        data.followUpRequired?data.nextFollowUpDate:null,data.status||'Open',req.auth.userId]);
@@ -5207,7 +5138,7 @@ app.post('/api/student-counsellings', authenticate, async (req,res)=>{
   }catch(error){console.error('Student counselling save error:',error.message);res.status(400).json({ok:false,message:error.message});}
 });
 
-app.get('/api/counselling-reviews/options',authenticate,async(_req,res)=>{
+app.get('/api/counselling-reviews/options',authenticate,async(req,res)=>{
   try{
     const [years,modes,purposes,students]=await Promise.all([
       pool.query(`SELECT academic_year_id AS id,COALESCE(NULLIF(academic_year_name,''),year_label) AS name,is_current
@@ -5238,12 +5169,13 @@ app.get('/api/counselling-reviews/options',authenticate,async(_req,res)=>{
         LEFT JOIN sections sec ON sec.section_id=sma.programme_section_id
         WHERE sma.allotment_status='Active' AND COALESCE(st.is_active,TRUE)=TRUE ORDER BY name`)
     ]);
-    res.json({ok:true,academicYears:years.rows,modes:modes.rows,purposes:purposes.rows,students:students.rows});
+    res.json({ok:true,academicYears:years.rows,modes:modes.rows,purposes:purposes.rows,students:['ADMIN','SUPER_ADMIN','INSTITUTE_ADMIN'].includes(req.auth.role)&&req.query.layoutOnly==='true'?[]:students.rows});
   }catch(error){console.error('Counselling review options error:',error.message);res.status(500).json({ok:false,message:'Unable to load counselling options.'});}
 });
 
 app.get('/api/counselling-reviews',authenticate,async(req,res)=>{
   try{
+    if(['ADMIN','SUPER_ADMIN','INSTITUTE_ADMIN'].includes(req.auth.role)&&req.query.layoutOnly==='true')return res.json({ok:true,counsellings:[]});
     const values=[],where=['TRUE'];
     const add=(value,column)=>{if(value){values.push(value);where.push(`${column}=$${values.length}`);}};
     add(req.query.academicYearId,'sc.academic_year_id');add(req.query.modeId,'sc.communication_mode_id');
@@ -5290,7 +5222,7 @@ app.get('/api/counselling-reviews/:id',authenticate,async(req,res)=>{
 });
 
 async function saveCounselling(req,res,id=null){
-  const data=req.body||{};
+  const data={...req.body,...(!id?{discussionDate:mentoringToday()}:{})};
   if(!data.academicYearId||!data.studentId||!data.discussionDate||!data.communicationModeId||!data.purposeId||!data.detailedDiscussion?.trim())
     return res.status(400).json({ok:false,message:'Complete all required counselling fields.'});
   try{
@@ -5364,7 +5296,7 @@ app.post('/api/counselling-reviews/:id/reviewer-remarks',authenticate,async(req,
 
 app.post('/api/parent-interactions', authenticate, async (req,res)=>{
   try{
-    const data=req.body||{};
+    const data={...req.body,interactionDate:mentoringToday()};
     if(!data.studentId||!data.mentorId||!data.interactionDate||!data.communicationMode||!data.discussionDetails?.trim())
       return res.status(400).json({ok:false,message:'Complete all required parent discussion fields.'});
     await pool.query(`INSERT INTO mentoring.parent_interactions
@@ -6012,5 +5944,6 @@ app.use((error, _req, res, next) => {
 
 // Initialize the database before opening the API port.
 initialiseAuthentication()
+  .then(() => applyMasterMigrations(pool))
   .then(() => app.listen(port, () => console.log(`Server listening on http://localhost:${port}`)))
   .catch((error) => { console.error('Database initialisation failed:', error.message); process.exitCode = 1; });
